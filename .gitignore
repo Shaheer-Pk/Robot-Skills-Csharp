@@ -1,0 +1,6 @@
+# Ignore Visual Studio temporary files and caches
+.vs/
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo

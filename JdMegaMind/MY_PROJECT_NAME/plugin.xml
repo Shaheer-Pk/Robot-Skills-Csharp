@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<PluginV1XML xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <FRIENDLY_NAME>JdMegaMind</FRIENDLY_NAME>
+  <DLL_FILENAME>JdMegaMind.dll</DLL_FILENAME>
+  <AUTHOR_NAME>Shaheer Hasan Khan</AUTHOR_NAME>
+  <LICENSE_URL>https://synthiam.com/Software/plugin-license.aspx</LICENSE_URL>
+  <PLUGIN_GUID>10742670-afa9-48bf-81d3-d0cd530ca1f5</PLUGIN_GUID>
+  <CATEGORY_TYPE>Beta</CATEGORY_TYPE>
+  <DESCRIPTION>Python Backend catered skill :D</DESCRIPTION>
+  <ALLOW_MULTIPLE_INSTANCES>false</ALLOW_MULTIPLE_INSTANCES>
+  <VersionRelease>0</VersionRelease>
+</PluginV1XML>
