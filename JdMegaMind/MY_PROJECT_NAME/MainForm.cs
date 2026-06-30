@@ -34,7 +34,7 @@ namespace JdMegaMind
         // TUNE THIS after real-world testing:
         //   - Triggering too easily on ambient noise? Raise it (e.g. 0.30)
         //   - Missing your voice? Lower it (e.g. 0.20)
-        private const float ENERGY_THRESHOLD = 0.7f;
+        private const float ENERGY_THRESHOLD = 0.35f;
 
         // How many milliseconds of consecutive silence after speech ends
         // before we consider the utterance complete and send it to Python.
@@ -116,11 +116,11 @@ namespace JdMegaMind
         private AudioBridgeStream _bridgeStream = null;
 
         // The Windows SAPI5 speech recognition engine.
-        // Configured with a single-phrase grammar ("Hello JD") and fed audio
+        // Configured with a single-phrase grammar ("Hello Clanker") and fed audio
         // from _bridgeStream so it shares NAudio's mic ownership — no handoff gap.
         private SpeechRecognitionEngine _speechRecognizer = null;
 
-        // Set to true when "Hello JD" is detected by the speech engine.
+        // Set to true when "Hello Clanker" is detected by the speech engine.
         // OnAudioDataAvailable checks this before buffering any audio.
         // Reset to false after each utterance is dispatched to Python,
         // returning the system to wake word hunting mode immediately.
@@ -296,7 +296,7 @@ namespace JdMegaMind
         // -----------------------------------------------------------------------
 
         /// <summary>
-        /// Fired by System.Speech.Recognition's internal thread when "Hello JD"
+        /// Fired by System.Speech.Recognition's internal thread when "Hello Clanker"
         /// is detected in the audio stream with sufficient confidence.
         ///
         /// Sets _isWakeWordDetected = true which unblocks OnAudioDataAvailable
@@ -312,7 +312,7 @@ namespace JdMegaMind
         {
             // Confidence threshold — reject low-confidence detections.
             // 0.7 means 70% confidence minimum. Reduces false positives from
-            // similar-sounding phrases. Tune this if legitimate "Hello JD" calls
+            // similar-sounding phrases. Tune this if legitimate "Hello Clanker" calls
             // are being rejected (lower it) or false triggers occur (raise it).
             if (e.Result.Confidence < 0.7f)
             {
@@ -321,7 +321,7 @@ namespace JdMegaMind
             }
 
             _isWakeWordDetected = true;
-            Log($"[Wake] 'Hello JD' detected ({e.Result.Confidence:P0} confidence). Listening for your question...");
+            Log($"[Wake] 'Hello Clanker' detected ({e.Result.Confidence:P0} confidence). Listening for your question...");
         }
 
         // -----------------------------------------------------------------------
@@ -397,11 +397,11 @@ namespace JdMegaMind
             // Define the grammar — the ONLY phrase the engine listens for.
             // GrammarBuilder constructs a simple phrase grammar from a string.
             // The engine ignores everything that doesn't match this phrase.
-            var grammar = new Grammar(new GrammarBuilder("Hello JD"));
+            var grammar = new Grammar(new GrammarBuilder("Hello Clanker"));
             _speechRecognizer.LoadGrammar(grammar);
 
             // Wire the detection event — fires on the speech engine's internal thread
-            // when "Hello JD" is heard with sufficient confidence.
+            // when "Hello Clanker" is heard with sufficient confidence.
             _speechRecognizer.SpeechRecognized += OnWakeWordDetected;
 
             // Point the speech engine at our bridge stream.
@@ -432,7 +432,7 @@ namespace JdMegaMind
                 // which has no handler, and ARC catches it displaying its own crash dialog.
                 // We catch it here instead and show a friendly log message.
                 _waveIn.StartRecording();
-                Log("[Hearing] Mic capture started. Listening for wake word 'Hello JD'...");
+                Log("[Hearing] Mic capture started. Listening for wake word 'Hello Clanker'...");
             }
             catch (NAudio.MmException ex)
             {
@@ -491,7 +491,7 @@ namespace JdMegaMind
         private void OnAudioDataAvailable(object sender, WaveInEventArgs e)
         {
             // Feed bytes to the bridge stream BEFORE any guard check.
-            // The speech engine needs a continuous audio feed to detect "Hello JD" —
+            // The speech engine needs a continuous audio feed to detect "Hello Clanker" —
             // even during _isProcessing (JD speaking) we keep feeding it so it stays
             // in sync and is ready to detect the wake word immediately after playback.
             // We only skip feeding if the session is fully cancelled.
@@ -561,9 +561,9 @@ namespace JdMegaMind
                     // Reset wake word flag immediately after dispatch.
                     // This returns the system to wake word hunting mode while Python
                     // processes the utterance in the background. The user must say
-                    // "Hello JD" again for the next interaction.
+                    // "Hello Clanker" again for the next interaction.
                     _isWakeWordDetected = false;
-                    Log("[Wake] Listening for 'Hello JD' again...");
+                    Log("[Wake] Listening for 'Hello Clanker' again...");
 
                     // Fire on a background thread — this is a synchronous event handler
                     // and must return immediately. The mic loop cannot block here.
