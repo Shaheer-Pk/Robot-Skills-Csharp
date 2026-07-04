@@ -144,6 +144,6 @@
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
     <PostBuildEvent>powershell -Command "Unblock-File 'C:\ProgramData\ARC\Plugins\10742670-afa9-48bf-81d3-d0cd530ca1f5\JdMegaMind.dll'"
-powershell -Command "Unblock-File 'C:\ProgramData\ARC\Plugins\10742670-afa9-48bf-81d3-d0cd530ca1f5\JdMegaMind.pdb'"</PostBuildEvent>
+</PostBuildEvent>
   </PropertyGroup>
 </Project>

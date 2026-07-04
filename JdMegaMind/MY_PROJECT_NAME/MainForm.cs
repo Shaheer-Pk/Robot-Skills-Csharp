@@ -437,9 +437,23 @@ namespace JdMegaMind
             catch (NAudio.MmException ex)
             {
                 Log($"[Hearing] Microphone error: {ex.Message}. Is a mic connected and enabled in Windows Sound Settings?");
-                _speechRecognizer?.RecognizeAsyncStop();
-                _speechRecognizer?.Dispose();
-                _speechRecognizer = null;
+
+                // StopFeeding() MUST come before RecognizeAsyncStop().
+                // StopFeeding() calls CompleteAdding() on the queue, which unblocks
+                // any Read() call currently waiting on Take(). Without this,
+                // RecognizeAsyncStop() blocks forever waiting for the engine to stop,
+                // while the engine is stuck in Read() waiting for bytes that never come.
+                // aka its trapped in a deadlock and ARC freezes
+                _bridgeStream?.StopFeeding();
+                _bridgeStream = null;
+
+                // Now stop the speech engine and dispose it — no more audio will be coming.
+                if (_speechRecognizer != null)
+                {
+                    _speechRecognizer.RecognizeAsyncStop();
+                    _speechRecognizer.Dispose();
+                    _speechRecognizer = null;
+                }
                 _bridgeStream = null;
                 _waveIn.Dispose();
                 _waveIn = null;
