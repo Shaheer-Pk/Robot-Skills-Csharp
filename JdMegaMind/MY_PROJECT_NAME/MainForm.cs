@@ -1,16 +1,18 @@
+using AForge.Imaging;
 using ARC;
 using NAudio.Wave;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
+using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Speech.Recognition;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Speech.Recognition;
 
 namespace JdMegaMind
 {
@@ -34,7 +36,7 @@ namespace JdMegaMind
         // TUNE THIS after real-world testing:
         //   - Triggering too easily on ambient noise? Raise it (e.g. 0.30)
         //   - Missing your voice? Lower it (e.g. 0.20)
-        private const float ENERGY_THRESHOLD = 0.7f;
+        private const float ENERGY_THRESHOLD = 0.35f;
 
         // How many milliseconds of consecutive silence after speech ends
         // before we consider the utterance complete and send it to Python.
@@ -116,11 +118,11 @@ namespace JdMegaMind
         private AudioBridgeStream _bridgeStream = null;
 
         // The Windows SAPI5 speech recognition engine.
-        // Configured with a single-phrase grammar ("Hello JD") and fed audio
+        // Configured with a single-phrase grammar ("Hello Robot") and fed audio
         // from _bridgeStream so it shares NAudio's mic ownership — no handoff gap.
         private SpeechRecognitionEngine _speechRecognizer = null;
 
-        // Set to true when "Hello JD" is detected by the speech engine.
+        // Set to true when "Hello Robot" is detected by the speech engine.
         // OnAudioDataAvailable checks this before buffering any audio.
         // Reset to false after each utterance is dispatched to Python,
         // returning the system to wake word hunting mode immediately.
@@ -129,11 +131,23 @@ namespace JdMegaMind
         // speech engine's internal thread. volatile prevents stale cached reads.
         private volatile bool _isWakeWordDetected = false;
 
+        // -----------------------------------------------------------------------
+        // UI CONTROLS
+        // -----------------------------------------------------------------------
+
         // UI Controls — held as fields so background threads can update them
         // safely via Invoke (marshalling back to the UI thread).
         private Button _btnListen;
+        private Button _btnCamera;
         private RichTextBox _logBox;
         private const int MAX_LOG_LINES = 100;
+
+        // -----------------------------------------------------------------------
+        // CAMERA CONFIGURATION
+        // -----------------------------------------------------------------------
+
+        private ARC.UCForms.FormCameraDevice _camera = null;
+        private CameraFrameUploader _cameraUploader = null;
 
         // -----------------------------------------------------------------------
         // CONSTRUCTOR & ARC LIFECYCLE
@@ -151,6 +165,14 @@ namespace JdMegaMind
             // This is functionally identical to using the designer — controls
             // added here behave identically to designer-placed controls.
             InitializeUI();
+
+            // Increase the default connection limit for HttpClient to avoid throttling
+            System.Net.ServicePointManager.DefaultConnectionLimit = 20;
+
+            // Free resources on ARC shutdown, project close, or skill removal.
+            // This is the only safe place to dispose _waveIn — disposing earlier risks
+            // and is a seperate clean-up mechanism other than the button-gated StopListening() sequence.
+            this.FormClosing += MainForm_FormClosing;
         }
 
         /// <summary>
@@ -187,13 +209,13 @@ namespace JdMegaMind
             _logBox.ScrollBars = RichTextBoxScrollBars.Vertical;
             this.Controls.Add(_logBox);
 
-            // Future feature buttons go here, e.g.:
-            // _btnCamera = new Button();
-            // _btnCamera.Text = "Start Camera";
-            // _btnCamera.Size = new System.Drawing.Size(160, 40);
-            // _btnCamera.Location = new System.Drawing.Point(180, 10);
-            // _btnCamera.Click += BtnCamera_Click;
-            // this.Controls.Add(_btnCamera);
+            // --- Camera button ---
+            _btnCamera = new Button();
+            _btnCamera.Text = "Start Camera";
+            _btnCamera.Size = new System.Drawing.Size(160, 40);
+            _btnCamera.Location = new System.Drawing.Point(180, 10);
+            _btnCamera.Click += BtnCamera_Click;
+            this.Controls.Add(_btnCamera);
         }
 
         /// <summary>
@@ -247,13 +269,26 @@ namespace JdMegaMind
         /// </summary>
         private void Log(string message)
         {
+            // Do not attempt to log if the form is already disposed or in the process of disposing.
+            if (this.IsDisposed || this.Disposing)
+                return;
+
             string line = $"[{DateTime.Now:HH:mm:ss}] {message}";
 
             if (this.InvokeRequired)
             {
-                // We are on a background thread — hand the write to the UI thread.
-                // We have to do this because windowsForm forces a single thread architecture
-                this.Invoke((Action)(() => AppendLog(line)));
+                try
+                {
+                    // We are on a background thread — hand the write to the UI thread.
+                    // We have to do this because windowsForm forces a single thread architecture
+                    this.Invoke((Action)(() => AppendLog(line)));
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Form was disposed between the IsDisposed check above and
+                    // this Invoke call — a genuine narrow race, not a bug to chase
+                    // further. Safe to ignore during shutdown.
+                }
             }
             else
             {
@@ -296,7 +331,7 @@ namespace JdMegaMind
         // -----------------------------------------------------------------------
 
         /// <summary>
-        /// Fired by System.Speech.Recognition's internal thread when "Hello JD"
+        /// Fired by System.Speech.Recognition's internal thread when "Hello Robot"
         /// is detected in the audio stream with sufficient confidence.
         ///
         /// Sets _isWakeWordDetected = true which unblocks OnAudioDataAvailable
@@ -312,7 +347,7 @@ namespace JdMegaMind
         {
             // Confidence threshold — reject low-confidence detections.
             // 0.7 means 70% confidence minimum. Reduces false positives from
-            // similar-sounding phrases. Tune this if legitimate "Hello JD" calls
+            // similar-sounding phrases. Tune this if legitimate "Hello Robot" calls
             // are being rejected (lower it) or false triggers occur (raise it).
             if (e.Result.Confidence < 0.7f)
             {
@@ -321,7 +356,7 @@ namespace JdMegaMind
             }
 
             _isWakeWordDetected = true;
-            Log($"[Wake] 'Hello JD' detected ({e.Result.Confidence:P0} confidence). Listening for your question...");
+            Log($"[Wake] 'Hello Robot' detected ({e.Result.Confidence:P0} confidence). Listening for your question...");
         }
 
         // -----------------------------------------------------------------------
@@ -361,7 +396,37 @@ namespace JdMegaMind
                 StopListening();
             }
         }
-        
+
+        /// <summary>
+        /// Toggles the camera stream on/off — same click-to-toggle shape as
+        /// BtnListen_Click. First click (camera not yet attached): calls
+        /// AttachCamera() and, only if it actually succeeded (i.e. _camera is no
+        /// longer null — AttachCamera can silently fail if no Camera Device skill
+        /// exists), flips the button to "Stop Camera". Second click: calls
+        /// DetachCamera() unconditionally and resets the button label.
+        ///
+        /// --- PURPOSE ---
+        /// 
+        /// Deliberately independent of BtnListen_Click / _isProcessing — the
+        /// camera stream must keep running regardless of whether JD is currently
+        /// listening, thinking, or speaking. This was a deliberate product
+        /// decision made earlier in this project, not an oversight.
+        /// </summary>
+        private void BtnCamera_Click(object sender, EventArgs e)
+        {
+            if (_camera == null)
+            {
+                AttachCamera();
+                if (_camera != null)
+                    _btnCamera.Text = "Stop Camera";
+            }
+            else
+            {
+                DetachCamera();
+                _btnCamera.Text = "Start Camera";
+            }
+        }
+
         // -----------------------------------------------------------------------
         // MIC CAPTURE LOOP
         // -----------------------------------------------------------------------
@@ -397,11 +462,11 @@ namespace JdMegaMind
             // Define the grammar — the ONLY phrase the engine listens for.
             // GrammarBuilder constructs a simple phrase grammar from a string.
             // The engine ignores everything that doesn't match this phrase.
-            var grammar = new Grammar(new GrammarBuilder("Hello JD"));
+            var grammar = new Grammar(new GrammarBuilder("Hello Robot"));
             _speechRecognizer.LoadGrammar(grammar);
 
             // Wire the detection event — fires on the speech engine's internal thread
-            // when "Hello JD" is heard with sufficient confidence.
+            // when "Hello Robot" is heard with sufficient confidence.
             _speechRecognizer.SpeechRecognized += OnWakeWordDetected;
 
             // Point the speech engine at our bridge stream.
@@ -432,14 +497,28 @@ namespace JdMegaMind
                 // which has no handler, and ARC catches it displaying its own crash dialog.
                 // We catch it here instead and show a friendly log message.
                 _waveIn.StartRecording();
-                Log("[Hearing] Mic capture started. Listening for wake word 'Hello JD'...");
+                Log("[Hearing] Mic capture started. Listening for wake word 'Hello Robot'...");
             }
             catch (NAudio.MmException ex)
             {
                 Log($"[Hearing] Microphone error: {ex.Message}. Is a mic connected and enabled in Windows Sound Settings?");
-                _speechRecognizer?.RecognizeAsyncStop();
-                _speechRecognizer?.Dispose();
-                _speechRecognizer = null;
+
+                // StopFeeding() MUST come before RecognizeAsyncStop().
+                // StopFeeding() calls CompleteAdding() on the queue, which unblocks
+                // any Read() call currently waiting on Take(). Without this,
+                // RecognizeAsyncStop() blocks forever waiting for the engine to stop,
+                // while the engine is stuck in Read() waiting for bytes that never come.
+                // aka its trapped in a deadlock and ARC freezes
+                _bridgeStream?.StopFeeding();
+                _bridgeStream = null;
+
+                // Now stop the speech engine and dispose it — no more audio will be coming.
+                if (_speechRecognizer != null)
+                {
+                    _speechRecognizer.RecognizeAsyncStop();
+                    _speechRecognizer.Dispose();
+                    _speechRecognizer = null;
+                }
                 _bridgeStream = null;
                 _waveIn.Dispose();
                 _waveIn = null;
@@ -491,7 +570,7 @@ namespace JdMegaMind
         private void OnAudioDataAvailable(object sender, WaveInEventArgs e)
         {
             // Feed bytes to the bridge stream BEFORE any guard check.
-            // The speech engine needs a continuous audio feed to detect "Hello JD" —
+            // The speech engine needs a continuous audio feed to detect "Hello Robot" —
             // even during _isProcessing (JD speaking) we keep feeding it so it stays
             // in sync and is ready to detect the wake word immediately after playback.
             // We only skip feeding if the session is fully cancelled.
@@ -561,9 +640,9 @@ namespace JdMegaMind
                     // Reset wake word flag immediately after dispatch.
                     // This returns the system to wake word hunting mode while Python
                     // processes the utterance in the background. The user must say
-                    // "Hello JD" again for the next interaction.
+                    // "Hello Robot" again for the next interaction.
                     _isWakeWordDetected = false;
-                    Log("[Wake] Listening for 'Hello JD' again...");
+                    Log("[Wake] Listening for 'Hello Robot' again...");
 
                     // Fire on a background thread — this is a synchronous event handler
                     // and must return immediately. The mic loop cannot block here.
@@ -606,6 +685,143 @@ namespace JdMegaMind
                 Log($"[Hearing] Recording stopped with error: {e.Exception.Message}");
             else
                 Log("[Hearing] Mic capture fully stopped.");
+        }
+
+        // -----------------------------------------------------------------------
+        // CAMERA PIPELINE
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Fired by EZ_B.Camera whenever a new frame has been captured — the event
+        /// itself carries no data (confirmed parameterless signature; there is no
+        /// EventArgs to read a frame from). The actual pixel data lives on a live
+        /// property, _camera.Camera.GetCurrentBitmapManaged, which this handler
+        /// must read and copy IMMEDIATELY: ARC's own camera pipeline can update
+        /// that property again the instant this method returns, so whatever we
+        /// don't copy synchronously, right here, is not guaranteed to still be
+        /// valid once we're on a different thread.
+        ///
+        /// `new Bitmap(original)` creates a fully independent copy (not just a
+        /// reference) — deliberately NOT `.Clone()`, to sidestep a known GDI+
+        /// OutOfMemoryException risk on a different Clone() overload, and because
+        /// the constructor form is the more standard pattern for copying a live/
+        /// streaming frame specifically.
+        ///
+        /// The actual upload work (JPEG encoding, HTTP POST, error handling) is
+        /// deliberately NOT done here — it's handed off via Task.Run to
+        /// CameraFrameUploader.UploadFrameAsync so this event handler returns as
+        /// fast as possible. Following threading guidance, camera events are
+        /// GUI-thread-adjacent — lengthy work here risks delaying/freezing ARC's
+        /// own UI, same category of concern already solved once for SpeakResponse.
+        /// </summary>
+        private void Camera_OnNewFrame()
+        {
+            if (_cameraUploader == null)
+            {
+                Log("The camera uploader has not yet been initialized. " +
+                    "Please check if the camera is attached and the uploader is set up correctly.");
+                return;
+            }
+                
+
+            var original = _camera.Camera.GetCurrentBitmapManaged;
+            if (original == null)
+            {
+                Log("Failed to retrieve the current bitmap from the camera. " +
+                    "Please ensure the camera is functioning correctly.");
+                return;
+            }
+
+            // Synchronous copy — must happen HERE, on this thread, before Task.Run.
+            // OnNewFrame carries no data of its own (confirmed parameterless
+            // signature) — we're reading a live property that ARC's pipeline can
+            // update again the moment this handler returns. This copy is our only
+            // snapshot. Using the Bitmap(Image) constructor rather than .Clone() —
+            // functionally equivalent for a full, unmodified copy, but avoids an
+            // object cast and matches the more commonly recommended pattern for
+            // copying a live/streaming frame specifically.
+            Bitmap frameClone = new Bitmap(original);
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _cameraUploader.UploadFrameAsync(frameClone);
+                }
+                catch (Exception ex)
+                {
+                    Log($"[Vision] Frame upload error: {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>
+        /// Locates ARC's existing Camera Device skill in the current project and
+        /// wires this skill up to receive its frames.
+        ///
+        /// IMPORTANT: this does NOT create a camera or start any video capture —
+        /// it only finds and attaches to a Camera Device skill that must already
+        /// exist and be configured in the ARC project. If no such skill is present,
+        /// GetControlByType returns an empty array and this logs a message and
+        /// returns without throwing — a missing camera skill is a configuration
+        /// problem to fix in ARC, not a code bug to crash over.
+        ///
+        /// A fresh CameraFrameUploader (and its long-lived visionHttpClient) is
+        /// created here, per attach session — mirroring how _bridgeStream and
+        /// _speechRecognizer are recreated each time StartListening() runs, rather
+        /// than living for the entire app's lifetime. The HttpClient reuse
+        /// requirement is about surviving per-frame churn within
+        /// one session, not literal app-lifetime — one Attach/Detach session's
+        /// worth of reuse is still enormous relative to 15-30 frames/second.
+        ///
+        /// Called from BtnCamera_Click when the button is toggled to "on".
+        /// </summary>
+        private void AttachCamera()
+        {
+            Control[] cameras = ARC.EZBManager.FormMain.GetControlByType(typeof(ARC.UCForms.FormCameraDevice));
+
+            if (cameras.Length == 0)
+            {
+                Log("[Vision] No Camera Device skill found in this ARC project.");
+                return;
+            }
+
+            _camera = (ARC.UCForms.FormCameraDevice)cameras[0];
+            _cameraUploader = new CameraFrameUploader(BACKEND_URL, Log);
+
+            _camera.Camera.OnNewFrame += Camera_OnNewFrame;
+
+            Log("[Vision] Camera attached. Streaming frames to backend.");
+        }
+
+        // <summary>
+        /// Reverses AttachCamera(): unsubscribes from OnNewFrame so no further
+        /// frames are processed, releases the camera reference, and disposes
+        /// CameraFrameUploader (which closes its visionHttpClient).
+        ///
+        /// Called from two places, deliberately: BtnCamera_Click (user manually
+        /// toggles the camera off) AND MainForm_FormClosing (skill/ARC shutting
+        /// down). Both paths reuse this exact same method rather than duplicating
+        /// teardown logic — same discipline already established for
+        /// StopListening()'s hearing-side cleanup.
+        ///
+        /// Safe to call even if AttachCamera() was never successfully run (e.g.
+        /// no camera skill was found) — every step is null-checked/null-conditional,
+        /// so calling this on an already-detached or never-attached state is a
+        /// harmless no-op, not an error.
+        /// </summary>
+        private void DetachCamera()
+        {
+            if (_camera != null)
+            {
+                _camera.Camera.OnNewFrame -= Camera_OnNewFrame;
+                _camera = null;
+            }
+
+            _cameraUploader?.Dispose();
+            _cameraUploader = null;
+
+            Log("[Vision] Camera detached.");
         }
 
         // -----------------------------------------------------------------------
@@ -943,6 +1159,66 @@ namespace JdMegaMind
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error
                 );
+            }
+        }
+
+        /// <summary>
+        /// Fires when ARC closes this skill (project closing, skill removed, or
+        /// ARC shutting down). Per Synthiam's Plugin Compliance guidance: always
+        /// unsubscribe/dispose here, wrapped in try/catch — an unhandled exception
+        /// during shutdown can crash ARC itself, not just this skill.
+        ///
+        /// Deliberately does NOT call StopListening() and wait on
+        /// OnRecordingStopped's async disposal — that chain assumes the form
+        /// stays alive long enough for the callback to fire safely. During a
+        /// real shutdown that's not guaranteed. Everything here is torn down
+        /// directly, synchronously, instead.
+        /// </summary>
+        private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            try
+            {
+                _listenCts?.Cancel();
+
+                // Same ordering rule as StartListening()'s catch block and
+                // StopListening(): StopFeeding() BEFORE RecognizeAsyncStop(), or
+                // the speech engine's internal thread deadlocks waiting on bytes
+                // that will never come — freezing ARC's shutdown entirely.
+                _bridgeStream?.StopFeeding();
+                _bridgeStream = null;
+
+                if (_speechRecognizer != null)
+                {
+                    _speechRecognizer.RecognizeAsyncStop();
+                    _speechRecognizer.Dispose();
+                    _speechRecognizer = null;
+                }
+
+                // Direct disposal — do NOT wait for OnRecordingStopped here.
+                if (_waveIn != null)
+                {
+                    // Detach BEFORE Stop/Dispose — RecordingStopped fires
+                    // asynchronously on a background thread even after this method
+                    // returns. Without detaching first, that late notification
+                    // tries to Log() into a RichTextBox that's already being torn
+                    // down as part of this same form closing — confirmed by the
+                    // ObjectDisposedException test run just.
+                    // Also furthur refined log to handle this issue as an indepth safeguard.
+                    _waveIn.DataAvailable -= OnAudioDataAvailable;
+                    _waveIn.RecordingStopped -= OnRecordingStopped;
+
+                    _waveIn.StopRecording();
+                    _waveIn.Dispose();
+                    _waveIn = null;
+                }
+
+                // Camera disposal
+                DetachCamera();
+            }
+            catch (Exception ex)
+            {
+                // Never let a shutdown-path exception escape unhandled.
+                try { Log($"[Shutdown] Cleanup error: {ex.Message}"); } catch { }
             }
         }
 
