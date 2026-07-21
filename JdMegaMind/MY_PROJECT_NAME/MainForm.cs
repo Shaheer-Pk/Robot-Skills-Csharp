@@ -349,7 +349,7 @@ namespace JdMegaMind
             // 0.7 means 70% confidence minimum. Reduces false positives from
             // similar-sounding phrases. Tune this if legitimate "Hello Robot" calls
             // are being rejected (lower it) or false triggers occur (raise it).
-            if (e.Result.Confidence < 0.7f)
+            if (e.Result.Confidence < 0.85f)
             {
                 Log($"[Wake] Low confidence detection ({e.Result.Confidence:P0}), ignoring.");
                 return;
