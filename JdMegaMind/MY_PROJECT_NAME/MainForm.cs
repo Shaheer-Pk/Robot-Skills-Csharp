@@ -150,6 +150,12 @@ namespace JdMegaMind
         private CameraFrameUploader _cameraUploader = null;
 
         // -----------------------------------------------------------------------
+        // MOOD CONFIGURATION
+        // -----------------------------------------------------------------------
+
+        private MoodPoller _moodPoller = null;   
+
+        // -----------------------------------------------------------------------
         // CONSTRUCTOR & ARC LIFECYCLE
         // -----------------------------------------------------------------------
 
@@ -173,6 +179,12 @@ namespace JdMegaMind
             // This is the only safe place to dispose _waveIn — disposing earlier risks
             // and is a seperate clean-up mechanism other than the button-gated StopListening() sequence.
             this.FormClosing += MainForm_FormClosing;
+
+            // Mood polling starts immediately, tied to skill lifecycle — not
+            // button-gated, per confirmed design (should reflect ambient decay
+            // even with mic/camera both off).
+            _moodPoller = new MoodPoller(BACKEND_URL, Log, RunMoodAction);
+            _moodPoller.Start();
         }
 
         /// <summary>
@@ -349,7 +361,7 @@ namespace JdMegaMind
             // 0.7 means 70% confidence minimum. Reduces false positives from
             // similar-sounding phrases. Tune this if legitimate "Hello Robot" calls
             // are being rejected (lower it) or false triggers occur (raise it).
-            if (e.Result.Confidence < 0.7f)
+            if (e.Result.Confidence < 0.85f)
             {
                 Log($"[Wake] Low confidence detection ({e.Result.Confidence:P0}), ignoring.");
                 return;
@@ -981,11 +993,6 @@ namespace JdMegaMind
             {
                 if (values != null && values.Length > 0 && !string.IsNullOrWhiteSpace(values[0]))
                 {
-                    // Task.Run fires SpeakResponse on a background thread so this
-                    // synchronous method returns immediately to ARC's script engine.
-                    // The async lambda allows us to properly await SpeakResponse
-                    // and manage _isProcessing with a finally block — identical
-                    // to how SendUtteranceToPython handles it.
                     _ = Task.Run(async () =>
                     {
                         _isProcessing = true;
@@ -1006,8 +1013,6 @@ namespace JdMegaMind
             }
             else
             {
-                // Forward unrecognized commands to ARC's base implementation
-                // so built-in ARC commands still work correctly.
                 base.SendCommand(command, values);
             }
         }
@@ -1054,6 +1059,24 @@ namespace JdMegaMind
 
                     var response = await client.PostAsync($"{BACKEND_URL}/brain/chat", content);
 
+                    // NEW — read the action header BEFORE reading the body. HttpResponseMessage
+                    // exposes headers and content as separate properties, not a tuple — this
+                    // is not Python-style unpacking, these are two independent reads off the
+                    // same response object.
+                    string actionJson = response.Headers.TryGetValues("X-JD-Action", out var actionValues)
+                        ? actionValues.FirstOrDefault()
+                        : null;
+
+                    // DEBUG — confirms what actually arrived on the C# side, independent of
+                    // what Python believes it sent. If Python's log shows a header was set
+                    // but this logs "no action header," the bug is in transit/header
+                    // naming, not in verification logic — narrows the search immediately.
+                    if (!string.IsNullOrEmpty(actionJson))
+                        Log($"[Brain] Action header received: {actionJson}");
+                    else
+                        Log("[Brain] No action header this turn.");
+
+                    // Handle HTTP errors gracefully — log and return, don't throw.
                     if (!response.IsSuccessStatusCode)
                     {
                         int code = (int)response.StatusCode;
@@ -1075,6 +1098,43 @@ namespace JdMegaMind
                             throw new Exception("Unexpected backend status: " + response.StatusCode);
                         }
                     }
+
+                    // NEW — fire the verified action, if one was sent. Deliberately done
+                    // BEFORE the audio playback block below, not after — per the confirmed
+                    // design intent (point 7): action and speech should happen together,
+                    // not sequentially. NOTE: whether firing this before vs. during vs.
+                    // after PlayData() actually produces true simultaneous execution on
+                    // real JD hardware is UNVERIFIED — flagged explicitly, needs real-robot
+                    // testing, not assumed safe.
+                    if (!string.IsNullOrEmpty(actionJson))
+                    {
+                        try
+                        {
+                            // In the header we did json.dumps to convert the Python list into a JSON array string.
+                            // Here we parse it back into a JArray (the reverse of json.dumps) and extract the three elements.
+                            // The reason of doing this was because the header is a string, so in the backend we converted the json into a string
+                            // and here we need to convert it back to a list/array to extract the elements.
+                            var actionArray = JArray.Parse(actionJson);
+                            string gadget = actionArray[0].Value<string>();
+                            string cmd = actionArray[1].Value<string>();
+                            string param = actionArray[2].Value<string>();
+                            RunAction(gadget, cmd, param);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Malformed header would be a Python-side bug (verify_action()
+                            // should never produce anything but a clean 3-element array or
+                            // omit the header entirely) — logged, not fatal, action simply
+                            // doesn't fire for this turn.
+                            Log($"[Brain] Failed to parse X-JD-Action header: {ex.Message}");
+                        }
+                    }
+
+                    // Fire-and-forget mood check — Python's apply_event() already ran
+                    // inside the /brain/chat call that just succeeded (confirmed call
+                    // order in emotions_module.md), so this is the freshest possible read.
+                    // Not awaited — must never delay audio playback.
+                    _moodPoller?.PollAfterSpeaking();
 
                     var audioBytes = await response.Content.ReadAsByteArrayAsync();
 
@@ -1163,6 +1223,53 @@ namespace JdMegaMind
         }
 
         /// <summary>
+        /// Executes an already-verified action by writing its gadget/cmd/param
+        /// onto the shared variable shelf for the single always-running watcher
+        /// script to pick up and execute.
+        ///
+        /// CHANGED — this method used to take a bare keyword and look it up
+        /// against a local ActionCommands dictionary. That lookup/whitelist has
+        /// moved entirely to Python (app/brain/services.py's verify_action()) —
+        /// ARC no longer makes any decision about whether an action is valid; it
+        /// blindly executes whatever three strings it's handed. This is the
+        /// intended "keep ARC dumb" outcome of the refactor — all verification
+        /// now happens once, server-side, not duplicated in two places.
+        /// </summary>
+        public void RunAction(string gadget, string cmd, string param)
+        {
+            ARC.Scripting.VariableManager.SetVariable("$JdGadget", gadget);
+            ARC.Scripting.VariableManager.SetVariable("$JdCmd", cmd);
+            ARC.Scripting.VariableManager.SetVariable("$JdParam", param);
+            Log($"[Action] Queued: {gadget} / {cmd} / {param}");
+        }
+
+        /// <summary>
+        /// Dispatches a mood-driven RGB Animator action via its OWN dedicated
+        /// variable slot — $JdMoodParam — deliberately separate from
+        /// $JdGadget/$JdCmd/$JdParam (physical action dispatch, see RunAction
+        /// above). Two independent producers writing the same slot could have
+        /// one silently overwrite the other before the watcher script's next
+        /// 100ms poll consumes it — the same "two sources of truth" failure
+        /// shape this project has already rejected elsewhere. A dedicated slot
+        /// makes that collision structurally impossible.
+        ///
+        /// Only ONE parameter, not a full triple: unlike physical actions
+        /// (which span multiple gadgets/commands), mood dispatch has exactly
+        /// one target, always — the built-in "RGB Animator" skill, via its
+        /// "AutoPositionAction" command. Confirmed empirically this session:
+        /// ControlCommand("RGB Animator", "AutoPositionAction", "Stripes")
+        /// against a real custom-built Action, visually confirmed firing.
+        /// Gadget/cmd are hardcoded directly in the watcher script (see
+        /// arc-csharp.md), not passed through here — they're constants for
+        /// this use case, not variables.
+        /// </summary>
+        public void RunMoodAction(string actionName)
+        {
+            ARC.Scripting.VariableManager.SetVariable("$JdMoodParam", actionName);
+            Log($"[Mood] Queued RGB Animator action: {actionName}");
+        }
+
+        /// <summary>
         /// Fires when ARC closes this skill (project closing, skill removed, or
         /// ARC shutting down). Per Synthiam's Plugin Compliance guidance: always
         /// unsubscribe/dispose here, wrapped in try/catch — an unhandled exception
@@ -1175,52 +1282,55 @@ namespace JdMegaMind
         /// directly, synchronously, instead.
         /// </summary>
         private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
-        {
-            try
-            {
-                _listenCts?.Cancel();
-
-                // Same ordering rule as StartListening()'s catch block and
-                // StopListening(): StopFeeding() BEFORE RecognizeAsyncStop(), or
-                // the speech engine's internal thread deadlocks waiting on bytes
-                // that will never come — freezing ARC's shutdown entirely.
-                _bridgeStream?.StopFeeding();
-                _bridgeStream = null;
-
-                if (_speechRecognizer != null)
                 {
-                    _speechRecognizer.RecognizeAsyncStop();
-                    _speechRecognizer.Dispose();
-                    _speechRecognizer = null;
-                }
+                    try
+                    {
+                        _listenCts?.Cancel();
 
-                // Direct disposal — do NOT wait for OnRecordingStopped here.
-                if (_waveIn != null)
-                {
-                    // Detach BEFORE Stop/Dispose — RecordingStopped fires
-                    // asynchronously on a background thread even after this method
-                    // returns. Without detaching first, that late notification
-                    // tries to Log() into a RichTextBox that's already being torn
-                    // down as part of this same form closing — confirmed by the
-                    // ObjectDisposedException test run just.
-                    // Also furthur refined log to handle this issue as an indepth safeguard.
-                    _waveIn.DataAvailable -= OnAudioDataAvailable;
-                    _waveIn.RecordingStopped -= OnRecordingStopped;
+                        // Same ordering rule as StartListening()'s catch block and
+                        // StopListening(): StopFeeding() BEFORE RecognizeAsyncStop(), or
+                        // the speech engine's internal thread deadlocks waiting on bytes
+                        // that will never come — freezing ARC's shutdown entirely.
+                        _bridgeStream?.StopFeeding();
+                        _bridgeStream = null;
 
-                    _waveIn.StopRecording();
-                    _waveIn.Dispose();
-                    _waveIn = null;
-                }
+                        if (_speechRecognizer != null)
+                        {
+                            _speechRecognizer.RecognizeAsyncStop();
+                            _speechRecognizer.Dispose();
+                            _speechRecognizer = null;
+                        }
 
-                // Camera disposal
-                DetachCamera();
-            }
+                        // Direct disposal — do NOT wait for OnRecordingStopped here.
+                        if (_waveIn != null)
+                        {
+                            // Detach BEFORE Stop/Dispose — RecordingStopped fires
+                            // asynchronously on a background thread even after this method
+                            // returns. Without detaching first, that late notification
+                            // tries to Log() into a RichTextBox that's already being torn
+                            // down as part of this same form closing — confirmed by the
+                            // ObjectDisposedException test run just.
+                            // Also furthur refined log to handle this issue as an indepth safeguard.
+                            _waveIn.DataAvailable -= OnAudioDataAvailable;
+                            _waveIn.RecordingStopped -= OnRecordingStopped;
+
+                            _waveIn.StopRecording();
+                            _waveIn.Dispose();
+                            _waveIn = null;
+                        }
+
+                        // Camera disposal
+                        DetachCamera();
+
+                        // Mood poller disposal
+                        _moodPoller?.Dispose();
+                    }
             catch (Exception ex)
-            {
-                // Never let a shutdown-path exception escape unhandled.
-                try { Log($"[Shutdown] Cleanup error: {ex.Message}"); } catch { }
-            }
-        }
+                    {
+                        // Never let a shutdown-path exception escape unhandled.
+                        try { Log($"[Shutdown] Cleanup error: {ex.Message}"); } catch { }
+                    }
+                }
 
         // Field required by ARC scaffold — holds the loaded configuration object.
         Configuration _config;

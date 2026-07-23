@@ -78,23 +78,23 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="aForge">
-      <HintPath>C:\Program Files (x86)\Synthiam Inc\ARC by Synthiam\\aForge.dll</HintPath>
+      <HintPath>E:\arc\aForge.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="ARC">
-      <HintPath>C:\Program Files (x86)\Synthiam Inc\ARC by Synthiam\\ARC.exe</HintPath>
+      <HintPath>E:\arc\ARC.exe</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="EZ_B">
-      <HintPath>C:\Program Files (x86)\Synthiam Inc\ARC by Synthiam\\EZ_B.dll</HintPath>
+      <HintPath>E:\arc\EZ_B.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="NAudio">
-      <HintPath>C:\Program Files (x86)\Synthiam Inc\ARC by Synthiam\NAudio.dll</HintPath>
+      <HintPath>E:\arc\NAudio.dll</HintPath>
     </Reference>
     <Reference Include="Newtonsoft.Json">
       <SpecificVersion>False</SpecificVersion>
-      <HintPath>C:\Program Files (x86)\Synthiam Inc\ARC by Synthiam\\Newtonsoft.Json.dll</HintPath>
+      <HintPath>E:\arc\Newtonsoft.Json.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="System" />
@@ -127,6 +127,7 @@
     <Compile Include="MainForm.Designer.cs">
       <DependentUpon>MainForm.cs</DependentUpon>
     </Compile>
+    <Compile Include="MoodPoller.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
