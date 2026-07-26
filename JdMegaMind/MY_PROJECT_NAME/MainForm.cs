@@ -131,6 +131,13 @@ namespace JdMegaMind
         // speech engine's internal thread. volatile prevents stale cached reads.
         private volatile bool _isWakeWordDetected = false;
 
+        // Holds the in-flight action-dispatch task for the CURRENT SpeakResponse
+        // call, so audio playback and physical actions can be awaited together
+        // via Task.WhenAll further down. Defaults to Task.CompletedTask so a
+        // turn with NO actions (verified_actions was null) still works correctly
+        // with WhenAll — waiting on an already-completed task costs nothing.
+        private Task _actionDispatchTask = Task.CompletedTask;
+
         // -----------------------------------------------------------------------
         // UI CONTROLS
         // -----------------------------------------------------------------------
@@ -361,7 +368,7 @@ namespace JdMegaMind
             // 0.7 means 70% confidence minimum. Reduces false positives from
             // similar-sounding phrases. Tune this if legitimate "Hello Robot" calls
             // are being rejected (lower it) or false triggers occur (raise it).
-            if (e.Result.Confidence < 0.85f)
+            if (e.Result.Confidence < 0.92f)
             {
                 Log($"[Wake] Low confidence detection ({e.Result.Confidence:P0}), ignoring.");
                 return;
@@ -1099,33 +1106,22 @@ namespace JdMegaMind
                         }
                     }
 
-                    // NEW — fire the verified action, if one was sent. Deliberately done
-                    // BEFORE the audio playback block below, not after — per the confirmed
-                    // design intent (point 7): action and speech should happen together,
-                    // not sequentially. NOTE: whether firing this before vs. during vs.
-                    // after PlayData() actually produces true simultaneous execution on
-                    // real JD hardware is UNVERIFIED — flagged explicitly, needs real-robot
-                    // testing, not assumed safe.
+                    // CHANGED — starts action dispatch as its own concurrent Task instead
+                    // of running it inline here. NOT awaited at this point — audio hasn't
+                    // even been read/played yet. Stored in _actionDispatchTask so it can be
+                    // awaited together with the audio-duration delay further down, via
+                    // Task.WhenAll — this is what makes action + speech genuinely
+                    // concurrent rather than sequential.
+                    _actionDispatchTask = Task.CompletedTask; // reset default for this turn
                     if (!string.IsNullOrEmpty(actionJson))
                     {
                         try
                         {
-                            // In the header we did json.dumps to convert the Python list into a JSON array string.
-                            // Here we parse it back into a JArray (the reverse of json.dumps) and extract the three elements.
-                            // The reason of doing this was because the header is a string, so in the backend we converted the json into a string
-                            // and here we need to convert it back to a list/array to extract the elements.
                             var actionArray = JArray.Parse(actionJson);
-                            string gadget = actionArray[0].Value<string>();
-                            string cmd = actionArray[1].Value<string>();
-                            string param = actionArray[2].Value<string>();
-                            RunAction(gadget, cmd, param);
+                            _actionDispatchTask = DispatchQueuedActions(actionArray);
                         }
                         catch (Exception ex)
                         {
-                            // Malformed header would be a Python-side bug (verify_action()
-                            // should never produce anything but a clean 3-element array or
-                            // omit the header entirely) — logged, not fatal, action simply
-                            // doesn't fire for this turn.
                             Log($"[Brain] Failed to parse X-JD-Action header: {ex.Message}");
                         }
                     }
@@ -1191,15 +1187,22 @@ namespace JdMegaMind
                                 EZBManager.EZBs[0].SoundV4.PlayData(gzipDecompressor, 100);     // Plays at 100 volume
                             }
 
-                            Log($"[Brain] JD speaking ({durationMs}ms). Mic locked for {totalWaitMs}ms.");
+                            Log($"[Brain] JD speaking ({durationMs}ms, estimated). Actions dispatching concurrently. Mic locked until both finish.");
 
-                            // Hold execution here for the full playback duration.
-                            // This is what makes async Task meaningful over async void —
-                            // the caller (SendUtteranceToPython) awaits this method and
-                            // only releases _isProcessing after this delay completes.
-                            await Task.Delay(totalWaitMs);
+                            // CHANGED — was: await Task.Delay(totalWaitMs);
+                            // Now waits for BOTH the audio-duration delay AND the action-dispatch
+                            // task, whichever finishes LAST. This closes a real gap: actions are no
+                            // longer instantaneous (they're gated by WaitForActionSlotFree, and can
+                            // genuinely take longer than the spoken sentence — a multi-action queue
+                            // like "wave then sit" has been observed taking 4+ seconds). The OLD
+                            // audio-only delay would have let the mic reactivate mid-action in that
+                            // case. _isProcessing (held by the caller awaiting this whole method)
+                            // now only releases once JD is truly done — talking AND moving.
+                            var overallStopwatch = System.Diagnostics.Stopwatch.StartNew();
+                            await Task.WhenAll(Task.Delay(totalWaitMs), _actionDispatchTask);
+                            overallStopwatch.Stop();
 
-                            Log("[Brain] Playback complete. Mic reactivated.");
+                            Log($"[Brain] Playback complete. Actual hold time: {overallStopwatch.ElapsedMilliseconds}ms (vs. {totalWaitMs}ms audio-only estimate). Mic reactivated.");
                         }
                     }
                 }
@@ -1267,6 +1270,121 @@ namespace JdMegaMind
         {
             ARC.Scripting.VariableManager.SetVariable("$JdMoodParam", actionName);
             Log($"[Mood] Queued RGB Animator action: {actionName}");
+        }
+
+        /// <summary>
+        /// Waits until the watcher script has drained $JdGadget back to "" —
+        /// i.e. confirms the PREVIOUS queued action has actually been picked up
+        /// — before returning control to the caller, who can then safely write
+        /// the NEXT action's triple without overwriting one still waiting to be
+        /// consumed.
+        ///
+        /// FIXES a real, empirically confirmed bug: RunAction() calls fired
+        /// back-to-back with no gate between them write $JdGadget/$JdCmd/$JdParam
+        /// faster than the watcher script's ~100ms poll can drain them — the
+        /// second write silently overwrites the first before it's ever read, and
+        /// the first action never physically fires. Confirmed on real hardware
+        /// this session (log showed both items "Queued," but only one — the
+        /// last write — actually executed).
+        ///
+        /// Uses ARC.Scripting.VariableManager.GetVariable — confirmed callable
+        /// directly from C# skill code via Synthiam's own documented Camera
+        /// Control example, not guessed.
+        ///
+        /// Polls every 50ms via Task.Delay (yields the thread each iteration —
+        /// not a busy-wait spin loop) with a hard timeout, so a stuck/never-
+        /// cleared variable can never hang this method — and therefore
+        /// SpeakResponse — indefinitely.
+        /// </summary>
+        private async Task WaitForActionSlotFree()
+        {
+            const int POLL_INTERVAL_MS = 50;
+            const int TIMEOUT_MS = 20000; // generous — normal drain is well under 100ms
+
+            int waited = 0;
+            while (waited < TIMEOUT_MS)
+            {
+                var current = ARC.Scripting.VariableManager.GetVariable("$JdGadget");
+                string currentStr = current?.ToString() ?? "";
+
+                // GetVariable() wraps String-typed values in a literal pair of quote
+                // characters as part of its return format — confirmed empirically this
+                // session (an empty variable read back as the 2-char string "" rather
+                // than a true empty string, and "Auto Position" read back with its
+                // quote marks embedded, even though it was written from C# with no
+                // quotes at all — ruling out the watcher script as the source).
+                // Strip exactly one leading and one trailing quote, if present, before
+                // comparing against empty.
+                if (currentStr.Length >= 2 && currentStr.StartsWith("\"") && currentStr.EndsWith("\""))
+                {
+                    currentStr = currentStr.Substring(1, currentStr.Length - 2);
+                }
+
+                if (string.IsNullOrEmpty(currentStr))
+                    return; // slot is genuinely free
+
+                await Task.Delay(POLL_INTERVAL_MS);
+                waited += POLL_INTERVAL_MS;
+            }
+
+            // Timed out — log and proceed anyway rather than hang SpeakResponse
+            // forever. Worst case is the SAME overwrite race this method exists
+            // to fix, for this ONE item — not a regression, just a bounded,
+            // logged fallback instead of an unbounded hang.
+            Log("[Brain] WaitForActionSlotFree timed out after 20000ms — proceeding anyway.");
+        }
+
+        /// <summary>
+        /// Sequentially dispatches every [gadget, cmd, param] triple in
+        /// actionArray, gated by WaitForActionSlotFree() between each one so the
+        /// watcher script never has an item overwritten before it's consumed
+        /// (see WaitForActionSlotFree's docstring for the bug this fixes).
+        ///
+        /// Returns a Task rather than being awaited immediately at the call
+        /// site — the caller (SpeakResponse) starts this running and holds onto
+        /// the Task, then awaits it TOGETHER with the audio-duration delay via
+        /// Task.WhenAll, so actions and speech genuinely run concurrently rather
+        /// than one blocking the other. This is what actually delivers "action
+        /// and speech happen together," previously just an untested assumption.
+        ///
+        /// Exceptions are caught and logged HERE, not allowed to propagate out —
+        /// consistent with how a parse failure on the header was already treated
+        /// (log, don't fire the top-level MessageBox reserved for genuinely
+        /// unexpected SpeakResponse failures). A hiccup in the movement pipeline
+        /// should never be treated as seriously as, say, the backend being
+        /// unreachable — audio has usually already started playing by the time
+        /// this runs, so a movement failure shouldn't retroactively look like
+        /// the whole turn failed.
+        /// </summary>
+        private async Task DispatchQueuedActions(JArray actionArray)
+        {
+            try
+            {
+                Log($"[Brain] Dispatching {actionArray.Count} queued action(s).");
+
+                int index = 0;
+                foreach (var inner in actionArray)
+                {
+                    string gadget = inner[0].Value<string>();
+                    string cmd = inner[1].Value<string>();
+                    string param = inner[2].Value<string>();
+
+                    // Gate BEFORE every write — confirms any PREVIOUS item was
+                    // drained first. Harmless/instant on the very first item,
+                    // since $JdGadget starts empty.
+                    await WaitForActionSlotFree();
+
+                    Log($"[Brain] Action {index + 1}/{actionArray.Count}: {gadget} / {cmd} / {param}");
+                    RunAction(gadget, cmd, param);
+                    index++;
+                }
+
+                Log("[Brain] Action queue fully dispatched.");
+            }
+            catch (Exception ex)
+            {
+                Log($"[Brain] Action dispatch failed: {ex.Message}");
+            }
         }
 
         /// <summary>

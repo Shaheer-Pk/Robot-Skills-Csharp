@@ -78,16 +78,13 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="aForge">
-      <HintPath>E:\arc\aForge.dll</HintPath>
-      <Private>False</Private>
+      <HintPath>C:\Program Files (x86)\Synthiam Inc\ARC by Synthiam\aForge.dll</HintPath>
     </Reference>
     <Reference Include="ARC">
-      <HintPath>E:\arc\ARC.exe</HintPath>
-      <Private>False</Private>
+      <HintPath>C:\Program Files (x86)\Synthiam Inc\ARC by Synthiam\ARC.exe</HintPath>
     </Reference>
     <Reference Include="EZ_B">
-      <HintPath>E:\arc\EZ_B.dll</HintPath>
-      <Private>False</Private>
+      <HintPath>C:\Program Files (x86)\Synthiam Inc\ARC by Synthiam\EZ_B.dll</HintPath>
     </Reference>
     <Reference Include="NAudio">
       <HintPath>E:\arc\NAudio.dll</HintPath>
