@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Media;
 using System.Net.Http;
 using System.Speech.Recognition;
 using System.Text;
@@ -27,7 +28,7 @@ namespace JdMegaMind
         // The base URL of the Python FastAPI backend.
         // Uses mDNS .local hostname instead of a raw IP — works reliably over
         // Eduroam which reassigns a new IP on every reconnect.
-        private const string BACKEND_URL = "http://DESKTOP-LJO38UV.local:8000";
+        private const string BACKEND_URL = "http://ShaheerHasan.local:8000";
 
         // Energy threshold for mic capture.
         // NAudio reports sample values as floats between -1.0 and 1.0.
@@ -1133,6 +1134,13 @@ namespace JdMegaMind
                     _moodPoller?.PollAfterSpeaking();
 
                     var audioBytes = await response.Content.ReadAsByteArrayAsync();
+
+                    // TEMP DEBUGGING REMOVE IT LATER, THIS IS TO TEST SPEECH FROM LAPTOP DIRECTLY
+                    using (MemoryStream ms = new MemoryStream(audioBytes))
+                    {
+                        SoundPlayer player = new SoundPlayer(ms);
+                        player.Play(); // Plays directly out of the PC sound card
+                    }
 
                     using (var rawStream = new MemoryStream(audioBytes))
                     using (var wavReader = new WaveFileReader(rawStream))
