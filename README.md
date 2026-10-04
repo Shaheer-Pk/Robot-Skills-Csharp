@@ -5,6 +5,15 @@ laptop mic audio and JD's camera feed, forwards both to a Python backend
 for processing, and executes whatever the backend decides JD should say
 and do.
 
+## Demo Links
+A **LinkedIn** post has been made showcasing the working of this robot ad its features. It consists of a main post and 3 mini demo posts.
+
+1) [`Main Post`](https://lnkd.in/p/dRd_6HXp)
+2) [`Emotion (Tsundere Personality) Showcase`](https://lnkd.in/p/dV7bFA94)
+3) [`Actions (Fitness Coach Personality) Showcase`](https://lnkd.in/p/dXTK29bc)
+
+4) [`Basic Working (Teacher Personality) Showcase`](https://lnkd.in/p/d9SGB7uf)
+
 ## This skill requires the Python backend to be running
 
 **On its own, this skill does nothing useful.** All speech recognition,
